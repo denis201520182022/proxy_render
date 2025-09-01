@@ -23,6 +23,7 @@ async def health_check():
     return {"status": "ok", "service": "OpenAI Proxy"}
 
 @app.get("/health")
+@app.head("/health")
 async def health():
     return {"status": "healthy", "openai_key_set": bool(OPENAI_API_KEY)}
 
