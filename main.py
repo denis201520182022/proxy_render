@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse
 import httpx
 import os
 import logging
@@ -24,12 +24,12 @@ async def health_check():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "openai_key_set": bool(OPENAI_API_KEY)}
 
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_openai(request: Request, path: str):
+# Основная функция для проксирования
+async def proxy_request(request: Request, path: str):
     """
-    Проксирует все запросы к OpenAI API
+    Общая функция для проксирования запросов к OpenAI API
     """
     try:
         # Получаем тело запроса
@@ -41,11 +41,13 @@ async def proxy_openai(request: Request, path: str):
         # Удаляем заголовки, которые могут вызвать проблемы
         headers.pop("host", None)
         headers.pop("content-length", None)
+        headers.pop("content-encoding", None)
+        headers.pop("transfer-encoding", None)
         
         # Добавляем или заменяем Authorization заголовок
         headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
         
-        # Формируем URL
+        # Формируем URL (всегда добавляем /v1 для OpenAI API)
         target_url = f"{OPENAI_API_URL}/v1/{path}"
         
         logger.info(f"Proxying {request.method} request to: {target_url}")
@@ -60,11 +62,28 @@ async def proxy_openai(request: Request, path: str):
                 params=request.query_params
             )
         
-        # Возвращаем ответ
+        # Подготавливаем заголовки ответа
+        response_headers = dict(response.headers)
+        # Удаляем проблемные заголовки ответа
+        response_headers.pop("content-length", None)
+        response_headers.pop("content-encoding", None)
+        response_headers.pop("transfer-encoding", None)
+        
+        # Обрабатываем содержимое ответа
+        try:
+            if response.headers.get("content-type", "").startswith("application/json"):
+                content = response.json()
+            else:
+                content = response.text
+        except:
+            content = {"error": "Failed to parse OpenAI response"}
+            
+        logger.info(f"Response status: {response.status_code}")
+        
         return JSONResponse(
-            content=response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text,
+            content=content,
             status_code=response.status_code,
-            headers=dict(response.headers)
+            headers=response_headers
         )
         
     except httpx.TimeoutException:
@@ -76,6 +95,57 @@ async def proxy_openai(request: Request, path: str):
     except Exception as e:
         logger.error(f"Unexpected error while proxying to {path}: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+# Маршрут для запросов с /v1 префиксом
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_openai_v1(request: Request, path: str):
+    """Проксирует запросы с /v1 префиксом"""
+    return await proxy_request(request, path)
+
+# Маршрут для прямых запросов без /v1 (для совместимости с вашим ботом)
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_openai_direct(request: Request, path: str):
+    """Проксирует прямые запросы без /v1"""
+    # Исключаем системные маршруты
+    system_routes = ["", "health", "docs", "openapi.json", "redoc"]
+    if path in system_routes or path.startswith("docs") or path.startswith("openapi"):
+        raise HTTPException(status_code=404, detail="Not found")
+    
+    logger.info(f"Direct route called: /{path}")
+    return await proxy_request(request, path)
+
+# Тестовый эндпоинт для проверки связи с OpenAI
+@app.post("/test")
+async def test_openai():
+    """Тестовый эндпоинт для проверки связи с OpenAI"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{OPENAI_API_URL}/v1/models",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}
+            )
+            
+        if response.status_code == 200:
+            models_data = response.json()
+            return {
+                "status": "success",
+                "openai_status": response.status_code,
+                "models_count": len(models_data.get("data", [])),
+                "message": "OpenAI API connection successful"
+            }
+        else:
+            return {
+                "status": "error",
+                "openai_status": response.status_code,
+                "message": "OpenAI API returned error"
+            }
+            
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "message": "Failed to connect to OpenAI API"
+        }
 
 if __name__ == "__main__":
     import uvicorn
