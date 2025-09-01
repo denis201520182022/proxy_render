@@ -35,25 +35,34 @@ async def proxy_request(request: Request, path: str):
         # Получаем тело запроса
         body = await request.body()
         
-        # Подготавливаем заголовки
-        headers = dict(request.headers)
+        # Подготавливаем заголовки с правильным User-Agent и другими заголовками
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "OpenAI/Python 1.0.0",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+        }
         
-        # Удаляем заголовки, которые могут вызвать проблемы
-        headers.pop("host", None)
-        headers.pop("content-length", None)
-        headers.pop("content-encoding", None)
-        headers.pop("transfer-encoding", None)
-        
-        # Добавляем или заменяем Authorization заголовок
-        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+        # Добавляем заголовки из оригинального запроса (кроме проблемных)
+        original_headers = dict(request.headers)
+        safe_headers = ["x-request-id", "x-client-version"]
+        for header_name in safe_headers:
+            if header_name in original_headers:
+                headers[header_name] = original_headers[header_name]
         
         # Формируем URL (всегда добавляем /v1 для OpenAI API)
         target_url = f"{OPENAI_API_URL}/v1/{path}"
         
-        logger.info(f"Proxying {request.method} request to: {target_url}")
+        logger.info(f"Proxying {request.method} {path} to OpenAI")
+        logger.info(f"Request body size: {len(body)} bytes")
         
-        # Выполняем запрос к OpenAI
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        # Выполняем запрос к OpenAI с правильными заголовками
+        async with httpx.AsyncClient(
+            timeout=120.0,
+            follow_redirects=True,
+            headers={"User-Agent": "OpenAI/Python 1.0.0"}
+        ) as client:
             response = await client.request(
                 method=request.method,
                 url=target_url,
@@ -62,24 +71,29 @@ async def proxy_request(request: Request, path: str):
                 params=request.query_params
             )
         
+        # Логируем ответ
+        logger.info(f"OpenAI response: {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"OpenAI error response: {response.text[:500]}")
+        
         # Подготавливаем заголовки ответа
-        response_headers = dict(response.headers)
-        # Удаляем проблемные заголовки ответа
-        response_headers.pop("content-length", None)
-        response_headers.pop("content-encoding", None)
-        response_headers.pop("transfer-encoding", None)
+        response_headers = {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+            "Access-Control-Allow-Headers": "*"
+        }
         
         # Обрабатываем содержимое ответа
         try:
             if response.headers.get("content-type", "").startswith("application/json"):
                 content = response.json()
             else:
-                content = response.text
-        except:
-            content = {"error": "Failed to parse OpenAI response"}
+                content = {"error": "Non-JSON response from OpenAI", "response": response.text[:1000]}
+        except Exception as e:
+            logger.error(f"Failed to parse OpenAI response: {e}")
+            content = {"error": "Failed to parse OpenAI response", "status": response.status_code}
             
-        logger.info(f"Response status: {response.status_code}")
-        
         return JSONResponse(
             content=content,
             status_code=response.status_code,
@@ -97,13 +111,22 @@ async def proxy_request(request: Request, path: str):
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 # Маршрут для запросов с /v1 префиксом
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_openai_v1(request: Request, path: str):
     """Проксирует запросы с /v1 префиксом"""
+    if request.method == "OPTIONS":
+        return JSONResponse(
+            content={},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
     return await proxy_request(request, path)
 
-# Маршрут для прямых запросов без /v1 (для совместимости с вашим ботом)
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+# Маршрут для прямых запросов без /v1
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_openai_direct(request: Request, path: str):
     """Проксирует прямые запросы без /v1"""
     # Исключаем системные маршруты
@@ -111,10 +134,20 @@ async def proxy_openai_direct(request: Request, path: str):
     if path in system_routes or path.startswith("docs") or path.startswith("openapi"):
         raise HTTPException(status_code=404, detail="Not found")
     
+    if request.method == "OPTIONS":
+        return JSONResponse(
+            content={},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
+    
     logger.info(f"Direct route called: /{path}")
     return await proxy_request(request, path)
 
-# Тестовый эндпоинт для проверки связи с OpenAI
+# Тестовый эндпоинт
 @app.post("/test")
 async def test_openai():
     """Тестовый эндпоинт для проверки связи с OpenAI"""
@@ -122,7 +155,10 @@ async def test_openai():
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(
                 f"{OPENAI_API_URL}/v1/models",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "User-Agent": "OpenAI/Python 1.0.0"
+                }
             )
             
         if response.status_code == 200:
@@ -137,7 +173,8 @@ async def test_openai():
             return {
                 "status": "error",
                 "openai_status": response.status_code,
-                "message": "OpenAI API returned error"
+                "message": "OpenAI API returned error",
+                "response": response.text[:500]
             }
             
     except Exception as e:
